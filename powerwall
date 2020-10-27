@@ -24,6 +24,7 @@ end
 # Main loop, run at end of file
 def main(argv)
   # Parse command line arguments
+  orig_argv = argv.dup
   verbose = false
   debug = false
   timeperiod = 5
@@ -59,7 +60,7 @@ def main(argv)
                       logfile == '-' ? $stdout :
                       logfile)
   logger.level = verbose ? Logger::DEBUG : Logger::INFO
-  logger.info("#{ME} starting up, with update every #{timeperiod}s")
+  logger.info("#{ME} starting up, update/#{timeperiod}s: #{ME} #{orig_argv.join(' ')}")
 
   # Set up tab-separated timeseries data output stream
   datastream = datafile && datafile != '-' ? open(datafile, 'a') : $stdout
