@@ -1,0 +1,250 @@
+#!/usr/bin/env ruby
+# powerwall - monitor local Tesla Powerwall
+# Andrew Ho (andrew@zeuscat.com)
+
+require 'optparse'
+require 'logger'
+require 'net/http'
+require 'net/https'
+require 'json'
+
+ME = File.basename($0)
+USAGE = "usage: #{ME} [-h] [-v] [-x] [-t sec] [-o log] [-d data] [-s state] hostname\n"
+FULL_USAGE = USAGE + <<'end'
+    -h                display this help text and exit
+    -v, --verbose     verbose mode, log extra information
+    -x, --debug       debug mode, run in foreground
+    -t, --timeperiod  fetch data with this periodicity in seconds (default 5)
+    -o, --logfile     write log messages to this file (default stderr)
+    -d, --datafile    write tab-separated data to this file (default stdout)
+    -s, --statefile   atomically update this file with current state as JSON
+    hostname          hostname of Tesla Powerwall
+end
+
+# Main loop, run at end of file
+def main(argv)
+  # Parse command line arguments
+  verbose = false
+  debug = false
+  timeperiod = 5
+  logfile = nil      # write log messages (logger output) to this file
+  datafile = nil     # write tab-separated (timeseries) data to this file
+  statefile = nil    # atomically update this file with current state as JSON
+  OptionParser.new do |opts|
+    opts.on('-h', '--help')    { puts FULL_USAGE; exit 0 }
+    opts.on('-v', '--verbose') { verbose = true }
+    opts.on('-x', '--debug')   { debug = true }
+    opts.on('-t', '--timeperiod=SEC')  { |str| timeperiod = str.to_i }
+    opts.on('-o', '--logfile=LOG')     { |str| logfile = str }
+    opts.on('-d', '--datafile=DATA')   { |str| datafile = str }
+    opts.on('-s', '--statefile=STATE') { |str| statefile = str }
+    begin
+      opts.parse!(argv)
+    rescue OptionParser::InvalidOption => e
+      abort "#{ME}: #{e}\n#{USAGE}"
+    end
+  end
+  hostname = argv.shift
+
+  # Sanity check command line argument values
+  unless timeperiod > 0
+    abort "#{ME}: time period must be positive number of seconds\n#{USAGE}"
+  end
+  if !hostname || hostname.nil? || hostname.empty?
+    abort "#{ME}: missing required Tesla Powerwall hostname argument\n#{USAGE}"
+  end
+
+  # Set up diagnostic logging
+  logger = Logger.new((debug || logfile.nil?) ? $stderr :
+                      logfile == '-' ? $stdout :
+                      logfile)
+  logger.level = verbose ? Logger::DEBUG : Logger::INFO
+  logger.info("#{ME} starting up, with update every #{timeperiod}s")
+
+  # Set up tab-separated timeseries data output stream
+  datastream = datafile && datafile != '-' ? open(datafile, 'a') : $stdout
+
+  # Get absolute path to statefile, since daemonizing does chdir()
+  statefile = File.expand_path(statefile) if statefile
+
+  # Daemonize, unless in debug mode
+  if debug
+    logger.info("running in foreground (#{Process.pid})")
+  else
+    logger.debug('daemonize()')
+    daemonize
+    logger.info("daemonized (#{Process.pid})")
+  end
+
+  # Main loop
+  status = 0
+  begin
+    powerwall = Powerwall.new(hostname, logger)
+    # TODO: handle initialization error (maybe initialize before daemonizing?)
+
+    run_periodic(timeperiod) do
+      # TODO: should we use the timestamp from the device response?
+      last_updated = Time.now.to_i
+      state = powerwall.flow
+      state['grid_up'] = powerwall.grid_up?
+      state['grid'] = 0 if !state['grid_up']
+      state['last_updated'] = last_updated
+
+      # Write tab-separated timeseries data
+      columns = [
+        Time.at(last_updated).strftime('%Y-%m-%dT%H:%M:%S'),
+        state['grid_up'],
+        state['grid'],
+        state['solar'],
+        state['powerwall'],
+        state['home'],
+      ]
+      logger.debug(columns.inspect)
+      datastream.puts(columns.join("\t"))
+      datastream.flush
+
+      logger.debug(state.inspect)
+      if statefile
+        atomic_write(statefile) do |fh|
+          logger.debug("tmpfile = #{fh.path.inspect}")
+          fh.puts(JSON.pretty_generate(state))
+        end
+      end
+    end
+
+    # Exit cleanly on usual termination signals
+  rescue Interrupt => e
+    logger.debug("Interrupt(#{e.message})")
+    logger.info('exiting cleanly on interrupt')
+    status = 0
+  rescue SignalException => e
+    logger.debug("SignalException(#{e.message})")
+    if e.message == 'SIGINT' || e.message == 'SIGTERM'
+      logger.info("exiting cleanly on #{e.message}")
+      status = 0
+    end
+
+  # Log and exit with non-zero status on uncaught exceptions
+  rescue Exception => e
+    logger.error("uncaught exception:\n#{e.message}, backtrace:\n" +
+                 e.backtrace.map { |s| "    #{s}" }.join("\n"))
+    status = 1
+  end
+
+  status
+end
+
+def daemonize
+  exit!(0) if fork
+  Process::setsid
+  exit!(0) if fork
+  Dir::chdir('/var/tmp')
+  File::umask(0)
+  $stdin.reopen('/dev/null')
+  $stdout.reopen('/dev/null', 'w')
+  $stderr.reopen('/dev/null', 'w')
+end
+
+# https://github.com/vloschiavo/powerwall2
+class Powerwall
+  def initialize(hostname, logger)
+    @hostname = hostname
+    @logger = logger
+    @http = Net::HTTP.new(@hostname, 443)
+    @http.use_ssl = true
+    @http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+  end
+
+  def grid_up?
+    response = fetch('/api/system_status/grid_status')
+    return response['grid_status'] &&
+           response['grid_status'] == 'SystemGridConnected'
+  end
+
+  def flow
+    response = fetch('/api/meters/aggregates')
+    power = lambda { |src|
+      n = response[src] && response[src]['instant_power']
+      (n.nil? || n.abs < 0.001) ? 0 : (n * 1000).to_i / 1000
+    }
+    retval = {
+      'grid'      => power.call('site'),     # positive is provided by grid
+      'solar'     => power.call('solar'),    # positive is provided by solar
+      'powerwall' => power.call('battery'),  # positive is provided by battery
+      'home'      => power.call('load'),     # positive is used by home
+    }
+    @logger.debug(retval.inspect)
+    retval
+  end
+
+  def fetch(request_uri)
+    @logger.debug("GET https://#{@hostname}/#{request_uri}")
+    request = Net::HTTP::Get.new(request_uri)
+    response = @http.request(request)
+    if response.code != '200'
+      @logger.error("status code #{response.code}")
+    elsif response.body.nil? || response.body.empty?
+      @logger.error("empty response body")
+    else
+      json = response.body
+      @logger.debug(json)
+      begin
+        data = JSON.parse(json)
+        return data
+      rescue JSON::ParserError => e
+        @logger.error("could not parse JSON: #{e.message}")
+      end
+    end
+  end
+  nil
+end
+
+# Write to a file atomically by writing to tempfile and calling rename()
+def atomic_write(filename)
+  # Generate probably-unique temporary filename, preserving extension
+  dir = File.dirname(filename)
+  extension = File.extname(filename)
+  basename = File.basename(filename, extension)
+  nonce = "#{Process.pid}_#{Time.now.strftime('%s%L')}_#{rand(1000000)}"
+  tmpfile = File.join(dir, "#{basename}.#{nonce}#{extension}")
+
+  File.open(tmpfile, 'w') do |fh|
+    retval = yield(fh)
+    fh.close
+
+    # Try to match old file permissions, if any
+    begin
+      old_stat = File.stat(filename)
+    rescue Errno::ENOENT
+    end
+    if old_stat
+      begin
+        File.chown(old_stat.uid, old_stat.gid, fh.path)
+        File.chmod(old_stat.mode, fh.path)
+      rescue Errno::EPERM, Errno::EACCES
+      end
+    end
+
+    # Atomically overwrite previous file, if any
+    File.rename(fh.path, filename)
+    retval
+  end
+end
+
+# Run block once per period in seconds
+def run_periodic(seconds)
+  prev = Time.now
+  while true
+    yield
+    prev += seconds
+    while true
+      now = Time.now
+      delay = (prev - now) / 2
+      break if delay < 0.001
+      sleep delay
+    end
+  end
+end
+
+# Run main loop and exit
+exit main(ARGV)
