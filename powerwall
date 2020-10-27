@@ -89,11 +89,13 @@ def main(argv)
       state = powerwall.flow
       state['grid_up'] = powerwall.grid_up?
       state['grid'] = 0 if !state['grid_up']
+      state['percentage'] = powerwall.percentage
       state['last_updated'] = last_updated
 
       # Write tab-separated timeseries data
       columns = [
         Time.at(last_updated).strftime('%Y-%m-%dT%H:%M:%S'),
+        state['percentage'],
         state['grid_up'],
         state['grid'],
         state['solar'],
@@ -127,6 +129,7 @@ def main(argv)
 
   # Log and exit with non-zero status on uncaught exceptions
   rescue Exception => e
+    response = fetch('/api/system_status/grid_status')
     logger.error("uncaught exception:\n#{e.message}, backtrace:\n" +
                  e.backtrace.map { |s| "    #{s}" }.join("\n"))
     status = 1
@@ -156,17 +159,25 @@ class Powerwall
     @http.verify_mode = OpenSSL::SSL::VERIFY_NONE
   end
 
+  # True if Powerwall reports grid is fully connected, false otherwise
   def grid_up?
     response = fetch('/api/system_status/grid_status')
     return response['grid_status'] &&
            response['grid_status'] == 'SystemGridConnected'
   end
 
+  # Remaining life of Powerwall battery, in percentage, rounded to tenths
+  def percentage
+    response = fetch('/api/system_status/soe')
+    return (response['percentage'] * 10).round / 10.0
+  end
+
+  # Return flow in integer watts to/from grid, solar, Powerwall, and home
   def flow
     response = fetch('/api/meters/aggregates')
     power = lambda { |src|
       n = response[src] && response[src]['instant_power']
-      (n.nil? || n.abs < 0.001) ? 0 : (n * 1000).to_i / 1000
+      n && n.round
     }
     retval = {
       'grid'      => power.call('site'),     # positive is provided by grid
