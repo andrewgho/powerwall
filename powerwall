@@ -129,7 +129,6 @@ def main(argv)
 
   # Log and exit with non-zero status on uncaught exceptions
   rescue Exception => e
-    response = fetch('/api/system_status/grid_status')
     logger.error("uncaught exception:\n#{e.message}, backtrace:\n" +
                  e.backtrace.map { |s| "    #{s}" }.join("\n"))
     status = 1
