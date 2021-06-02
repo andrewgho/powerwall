@@ -175,7 +175,7 @@ class Powerwall
   def flow
     response = fetch('/api/meters/aggregates')
     power = lambda { |src|
-      n = response[src] && response[src]['instant_power']
+      n = response && response[src] && response[src]['instant_power']
       n && n.round
     }
     retval = {
