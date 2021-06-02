@@ -24,6 +24,7 @@ end
 # Main loop, run at end of file
 def main(argv)
   # Parse command line arguments
+  password = nil
   orig_argv = argv.dup
   verbose = false
   debug = false
@@ -47,11 +48,17 @@ def main(argv)
   end
   hostname = argv.shift
 
+  # Password must be passed in environment
+  password = ENV['POWERWALL_PASSWORD']
+  if password.nil? || password.empty?
+    abort "#{ME}: missing required password in POWERWALL_PASSWORD environment variable"
+  end
+
   # Sanity check command line argument values
   unless timeperiod > 0
     abort "#{ME}: time period must be positive number of seconds\n#{USAGE}"
   end
-  if !hostname || hostname.nil? || hostname.empty?
+  if hostname.nil? || hostname.empty?
     abort "#{ME}: missing required Tesla Powerwall hostname argument\n#{USAGE}"
   end
 
@@ -80,7 +87,7 @@ def main(argv)
   # Main loop
   status = 0
   begin
-    powerwall = Powerwall.new(hostname, logger)
+    powerwall = Powerwall.new(hostname, password, logger)
     # TODO: handle initialization error (maybe initialize before daemonizing?)
 
     run_periodic(timeperiod) do
@@ -150,25 +157,38 @@ end
 
 # https://github.com/vloschiavo/powerwall2
 class Powerwall
-  def initialize(hostname, logger)
+  def initialize(hostname, password, logger)
     @hostname = hostname
+    @password = password
     @logger = logger
     @http = Net::HTTP.new(@hostname, 443)
     @http.use_ssl = true
     @http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+    @authtoken = login!
+  end
+
+  def login!
+    response = fetch('/api/login/Basic', {
+      'username'     => 'customer',
+      'password'     => @password,
+      'email'        => 'nobody@example.com',
+      'force_sm_off' => false,  # TODO: is this needed?
+                     })
+    return response && response['token']
   end
 
   # True if Powerwall reports grid is fully connected, false otherwise
   def grid_up?
     response = fetch('/api/system_status/grid_status')
-    return response['grid_status'] &&
+    return response &&
+           response['grid_status'] &&
            response['grid_status'] == 'SystemGridConnected'
   end
 
   # Remaining life of Powerwall battery, in percentage, rounded to tenths
   def percentage
     response = fetch('/api/system_status/soe')
-    return (response['percentage'] * 10).round / 10.0
+    return response && (response['percentage'] * 10).round / 10.0
   end
 
   # Return flow in integer watts to/from grid, solar, Powerwall, and home
@@ -188,9 +208,18 @@ class Powerwall
     retval
   end
 
-  def fetch(request_uri)
-    @logger.debug("GET https://#{@hostname}/#{request_uri}")
-    request = Net::HTTP::Get.new(request_uri)
+  def fetch(request_uri, post_data = nil)
+    method = post_data ? 'POST' : 'GET'
+    @logger.debug("#{method} https://#{@hostname}/#{request_uri}")
+    request = nil
+    if method == 'POST'
+      request = Net::HTTP::Post.new(request_uri)
+      request['content-type'] = 'application/json'
+      request.body = post_data.to_json
+    else
+      request = Net::HTTP::Get.new(request_uri)
+    end
+    request['cookie'] = "AuthCookie=#{@authtoken}" if @authtoken
     response = @http.request(request)
     if response.code != '200'
       @logger.error("status code #{response.code}")
@@ -206,8 +235,8 @@ class Powerwall
         @logger.error("could not parse JSON: #{e.message}")
       end
     end
+    nil
   end
-  nil
 end
 
 # Write to a file atomically by writing to tempfile and calling rename()
