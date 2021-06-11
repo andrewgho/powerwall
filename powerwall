@@ -220,20 +220,24 @@ class Powerwall
       request = Net::HTTP::Get.new(request_uri)
     end
     request['cookie'] = "AuthCookie=#{@authtoken}" if @authtoken
-    response = @http.request(request)
-    if response.code != '200'
-      @logger.error("status code #{response.code}")
-    elsif response.body.nil? || response.body.empty?
-      @logger.error("empty response body")
-    else
-      json = response.body
-      @logger.debug(json)
-      begin
-        data = JSON.parse(json)
-        return data
-      rescue JSON::ParserError => e
-        @logger.error("could not parse JSON: #{e.message}")
+    begin
+      response = @http.request(request)
+      if response.code != '200'
+        @logger.error("status code #{response.code}")
+      elsif response.body.nil? || response.body.empty?
+        @logger.error("empty response body")
+      else
+        json = response.body
+        @logger.debug(json)
+        begin
+          data = JSON.parse(json)
+          return data
+        rescue JSON::ParserError => e
+          @logger.error("could not parse JSON: #{e.message}")
+        end
       end
+    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
+      @logger.error("could not connect to #{@hostname}: #{e.message}")
     end
     nil
   end
