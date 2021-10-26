@@ -4,8 +4,6 @@
 
 require 'optparse'
 require 'logger'
-require 'net/http'
-require 'net/https'
 require 'json'
 
 ME = File.basename($0)
@@ -161,10 +159,8 @@ class Powerwall
     @hostname = hostname
     @password = password
     @logger = logger
-    @http = Net::HTTP.new(@hostname, 443)
-    @http.use_ssl = true
-    @http.verify_mode = OpenSSL::SSL::VERIFY_NONE
     @authtoken = login!
+    raise 'no authentication token from login' unless @authtoken
   end
 
   def login!
@@ -210,24 +206,29 @@ class Powerwall
 
   def fetch(request_uri, post_data = nil)
     method = post_data ? 'POST' : 'GET'
-    @logger.debug("#{method} https://#{@hostname}/#{request_uri}")
-    request = nil
+    url = "https://#{@hostname}#{request_uri}"
+    @logger.debug("#{method} #{url}")
+    curl_args = ['-sk']
     if method == 'POST'
-      request = Net::HTTP::Post.new(request_uri)
-      request['content-type'] = 'application/json'
-      request.body = post_data.to_json
-    else
-      request = Net::HTTP::Get.new(request_uri)
+      curl_args.push('-X', 'POST')
+      curl_args.push('-H', 'Content-Type: application/json')
+      if post_data
+        curl_args.push('-d', post_data.to_json)
+      end
     end
-    request['cookie'] = "AuthCookie=#{@authtoken}" if @authtoken
+    curl_args.push('-H', "Cookie: AuthCookie=#{@authtoken}") if @authtoken
+    curl_args.push(url)
     begin
-      response = @http.request(request)
-      if response.code != '200'
-        @logger.error("status code #{response.code}")
-      elsif response.body.nil? || response.body.empty?
+      lines = []
+      @logger.debug("curl #{curl_args.join(' ')}")
+      retval = run_command('curl', curl_args) { |line| lines.push(line) }
+      @logger.debug(retval.inspect)
+      if retval.exitstatus != 0
+        @logger.error("curl #{curl_args.inspect} return value #{retval.exitstatus}")
+      elsif lines.empty?
         @logger.error("empty response body")
       else
-        json = response.body
+        json = lines.join('')
         @logger.debug(json)
         begin
           data = JSON.parse(json)
@@ -236,8 +237,6 @@ class Powerwall
           @logger.error("could not parse JSON: #{e.message}")
         end
       end
-    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH => e
-      @logger.error("could not connect to #{@hostname}: #{e.message}")
     end
     nil
   end
@@ -273,6 +272,29 @@ def atomic_write(filename)
     File.rename(fh.path, filename)
     retval
   end
+end
+
+# Safely run a command with no shell escapes, pass output lines to callback
+def run_command(cmd, args)
+  raise ArgumentError.new('missing required cmd to run') if cmd.nil?
+  rd, wr = IO.pipe
+  if fork
+    wr.close
+    if block_given?
+      rd.each { |line| yield(line) }
+    else
+      rd.read
+    end
+    rd.close
+    Process.wait
+  else
+    rd.close
+    $stdout.reopen(wr)
+    $stderr.reopen(wr)
+    exec cmd, *args
+    raise "exec #{cmd} failed"
+  end
+  $?
 end
 
 # Run block once per period in seconds
